@@ -1,0 +1,114 @@
+# Salesforce tests
+
+- `test_salesforce_table.py`: unit tests. Salesforce is mocked with `requests_mock`; real responses come from the
+  fixtures in `cases/`. No credentials needed.
+- `test_salesforce_source.py`: live tests against the seeded test org. They only read data, except
+  `test_incremental_changes`: it adds, updates and deletes its own `DltChanges__c` records between incremental
+  runs.
+- `test_salesforce_performance.py`: performance tests against the [performance org](#performance-org), marked
+  `performance`. `pytest.ini` deselects them.
+
+## Test org
+
+The tests use a Salesforce Developer Edition org (5 MB data storage, 15,000 API calls and 10,000 Bulk
+API 2.0 query jobs per day). To set up a new one:
+
+1. Sign up for a Developer Edition org and note its My Domain, e.g. `mycompany-dev-ed.develop.my.salesforce.com`.
+2. In Setup, create an External Client App with OAuth enabled, the `api` scope and the client credentials flow
+   enabled. Set **Run As** to a System Administrator: the seed deploys metadata as this user.
+3. Put the credentials in `sources/.dlt/secrets.toml`. CI reads the same keys from the secrets vault:
+
+   ```toml
+   [sources.salesforce.credentials]
+   consumer_key = "..."
+   consumer_secret = "..."
+   domain = "mycompany-dev-ed.develop.my"  # My Domain without .salesforce.com
+   ```
+
+## Seeding
+
+Run from the repository root. The script resolves credentials from `sources/.dlt` like the tests do:
+
+```sh
+uv run python -m tests.salesforce.seed.seed all  # or deploy | load | capture
+```
+
+- `deploy`: creates the `DltTypes__c`, `DltPages__c` and `DltChanges__c` custom objects and adds the
+  `Dlt_Seed_Id__c` external id to standard objects. It assigns the `Dlt_Seed` permission set to the Run As user
+  and makes them a Marketing User, which is needed to create campaigns.
+- `load`: writes the records in `seed/data.py`. Most are upserted on their seed id. Pricebook entries,
+  opportunity line items, roles, tasks and events are created only when missing. Then it creates and deletes
+  2 `DltTypes__c` records, a line item, and an opportunity with its line item, so the recycle bin has records
+  for `queryAll`.
+- `capture`: writes the `DltTypes__c` describe and its Bulk API result page to `cases/`. The unit tests compare
+  these with `seed/data.py`.
+
+Each step needs a new client: the Metadata API deploy of `simple_salesforce` leaves XML headers on the client
+and the following REST calls fail with 415.
+
+`DltTypes__c` also has a record over 2 MiB in six long text fields and formula fields that divide, which
+Salesforce rounds to the field scale.
+
+The incremental tests read `DltPages__c` on `Changed_At__c`: unique seconds over 90 days, in an order unrelated
+to the record number. Salesforce sets `SystemModstamp` itself, so the seed cannot spread it. The expected counts
+are computed from `seed/data.py`.
+
+`load` is safe to repeat. Pause between live test runs to stay within the org's daily limits.
+
+## Seeded vs. existing data
+
+A new org comes with its own users, roles, accounts, products and so on. The tests never count all rows of a
+standard object:
+
+- **Records of standard objects:** counted by `Dlt_Seed_Id__c IS NOT NULL`.
+- **Tasks and events:** counted by the `dlt ` prefix of their subject.
+- **Users and roles:** only lower bounds are checked.
+- **`DltTypes__c` and `DltPages__c`:** hold only seeded records.
+- **`DltChanges__c`:** holds only records of test runs, read by the `Run_Id__c` of the run. A run deletes its
+  records at the end, they stay in the recycle bin for 15 days.
+
+Deleted records stay in the recycle bin for 15 days, so the tests do not count them. The deleted records of
+the seed are purged 15 days after the last `load`, then the tests of deleted records check nothing until the
+next `load`.
+
+## Changing seed data
+
+Upserts only add and change data, so the org can keep data that `seed/data.py` no longer has:
+
+- **A value removed from a record** is not cleared. Set it to `None` instead.
+- **A record removed from `data.py`** is not deleted. Delete it in Salesforce. The tests compare all
+  `DltTypes__c` records and count every record with a seed id.
+- **A field removed from the metadata** is not deleted from the object.
+- **Records created when missing** (pricebook entries, roles, tasks, events) are not updated. Delete them
+  in Salesforce to recreate them.
+
+After changing `DltTypes__c` records or fields, run `load` and `capture`, then commit `cases/`. If Salesforce
+stores a value differently than seeded (e.g., rounds a number or trims whitespace), add it to `STORED_AS` in
+`seed/data.py`.
+
+## Performance org
+
+The test org has no room for large objects, so the performance data lives in a scratch org created with the test
+org as the Dev Hub, from `seed/performance-scratch-def.json`. Its credentials go to
+`[sources.salesforce_performance.credentials]`. Seed it with the test data and the performance data:
+
+```sh
+uv run python -m tests.salesforce.seed.seed all --performance  # or deploy | load | verify
+```
+
+`DltPerfA__c` and `DltPerfB__c` hold 50,000 records each with 12 fields of the common types. `Changed_At__c` has
+unique seconds over two years, in an order unrelated to `Number__c`. The values come from `perf_record` in
+`seed/data.py`. `load` stops when the records do not fit in the data storage left in the org and ends with `verify`,
+which compares every record with `seed/data.py`.
+
+```sh
+ALL_DESTINATIONS='["duckdb"]' uv run pytest -m performance -s tests/salesforce/test_salesforce_performance.py
+```
+
+Performance tests and `--performance` seeds print a summary of their HTTP requests and warn when the API
+throttled any, the timings of such a run are not comparable. They lock the account in the temp directory, so a
+second run on the same machine fails at once. Set `PERF_RESULTS` to an absolute path to append the results as JSON
+lines.
+
+`uv run python -m tests.salesforce.seed.seed jwt-app --performance --certificate client.crt` deploys an External
+Client App for clients that log in with the JWT bearer flow, pre-authorized for the org admin.

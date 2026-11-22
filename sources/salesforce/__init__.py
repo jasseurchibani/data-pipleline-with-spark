@@ -1,0 +1,234 @@
+"""Loads Salesforce sObjects with the Bulk API 2.0.
+
+`salesforce_source` loads the sObjects in `SOURCE_SOBJECTS`, `salesforce_table` loads any sObject,
+including custom objects.
+
+Salesforce API docs: https://developer.salesforce.com/docs/apis
+"""
+
+from functools import partial
+from typing import Any, Dict, Iterable, List, Optional
+
+import dlt
+from dlt.common.configuration import with_config
+from dlt.common.configuration.specs import ConfigSectionContext, known_sections
+from dlt.common.schema.typing import TWriteDispositionConfig
+from dlt.common.typing import TAnyDateTime, TColumnNames
+from dlt.sources import DltResource
+from dlt.sources.helpers.requests import Client, Session
+
+from .helpers.connection import SalesforceConnection, is_concurrent_limit_exceeded
+from .helpers.credentials import SalesforceAuth, make_salesforce_client
+from .helpers.query import TQueryApi
+from .helpers.table import (
+    DEFAULT_INCREMENTAL,
+    SOURCE_SECTION,
+    TTableBackend,
+    is_default_incremental,
+    table_resource,
+)
+
+# resource names and the sObjects they load
+SOURCE_SOBJECTS = {
+    "sf_user": "User",
+    "user_role": "UserRole",
+    "opportunity": "Opportunity",
+    "opportunity_line_item": "OpportunityLineItem",
+    "opportunity_contact_role": "OpportunityContactRole",
+    "account": "Account",
+    "contact": "Contact",
+    "lead": "Lead",
+    "campaign": "Campaign",
+    "campaign_member": "CampaignMember",
+    "product_2": "Product2",
+    "pricebook_2": "Pricebook2",
+    "pricebook_entry": "PricebookEntry",
+    "task": "Task",
+    "event": "Event",
+}
+
+
+def _connection(
+    credentials: SalesforceAuth, session: Optional[Session]
+) -> SalesforceConnection:
+    # retries 429, 5xx and the concurrent request limit, other errors are raised by simple_salesforce
+    session = (
+        session
+        or Client(
+            raise_for_status=False, retry_condition=is_concurrent_limit_exceeded
+        ).session
+    )
+    return SalesforceConnection(partial(make_salesforce_client, credentials, session))
+
+
+@dlt.source(name="salesforce")
+def salesforce_source(
+    credentials: SalesforceAuth = dlt.secrets.value,
+    session: Optional[Session] = None,
+    start_date: Optional[TAnyDateTime] = None,
+    write_disposition: Optional[TWriteDispositionConfig] = None,
+    soql_filters: Optional[Dict[str, str]] = None,
+    include_deleted: bool = True,
+    double_as_decimal: bool = False,
+    backend: TTableBackend = "auto",
+    api: TQueryApi = "auto",
+    chunk_size: int = 50000,
+    defer_table_reflect: bool = False,
+) -> Iterable[DltResource]:
+    """Loads the most common Salesforce sObjects, see `SOURCE_SOBJECTS`.
+
+    Every resource is a `salesforce_table` and the arguments are passed to all of them. Resources
+    run their queries in parallel. Use `with_resources` to select sObjects and `apply_hints` to
+    change e.g. the incremental of a single resource.
+
+    Args:
+        credentials (SalesforceAuth): Salesforce credentials.
+        session (Optional[Session]): Requests session used by `simple_salesforce`, by default
+            a session retrying HTTP 429, 5xx and the limit of concurrent long requests.
+        start_date (Optional[TAnyDateTime]): Loads records changed since this date on the first
+            run, all records if not set. See `salesforce_table`.
+        write_disposition (Optional[TWriteDispositionConfig]): Write disposition of all resources,
+            "replace" reloads all records, or the records changed since `start_date`, on each
+            run. Derived per sObject if not set.
+        soql_filters (Optional[Dict[str, str]]): SOQL conditions by resource name, e.g.
+            `{"opportunity": "IsClosed = false"}`.
+        include_deleted (bool): Also loads deleted records still in the recycle bin and archived
+            activities, and deletes them from the destination when merging.
+        double_as_decimal (bool): Loads `double` and `percent` fields as decimals.
+        backend (TTableBackend): "pyarrow" yields Arrow tables, "python" lists of dicts and does
+            not require `pyarrow`. "auto" uses `pyarrow` if installed.
+        api (TQueryApi): "bulk" or "rest" API, "auto" uses the Bulk API 2.0 and the REST API for
+            sObjects not supported by it.
+        chunk_size (int): Maximum number of records in a result page.
+        defer_table_reflect (bool): Logs in and describes the sObjects only when extracting, so
+            creating the source makes no API calls. Enable when running on Airflow.
+
+    Returns:
+        Iterable[DltResource]: Resources loading the sObjects.
+    """
+    soql_filters = soql_filters or {}
+    unknown = set(soql_filters) - set(SOURCE_SOBJECTS)
+    if unknown:
+        raise ValueError(f"`soql_filters` for unknown resources: {sorted(unknown)}")
+    connection = _connection(credentials, session)
+    return [
+        table_resource(
+            connection,
+            sobject,
+            name=name,
+            start_date=start_date,
+            soql_filter=soql_filters.get(name),
+            include_deleted=include_deleted,
+            double_as_decimal=double_as_decimal,
+            backend=backend,
+            api=api,
+            chunk_size=chunk_size,
+            write_disposition=write_disposition,
+            parallelized=True,
+            defer_table_reflect=defer_table_reflect,
+        )
+        for name, sobject in SOURCE_SOBJECTS.items()
+    ]
+
+
+@with_config(
+    sections=(known_sections.SOURCES, SOURCE_SECTION),
+    section_arg_name="sobject",
+    sections_merge_style=ConfigSectionContext.resource_merge_style,
+)
+def salesforce_table(
+    credentials: SalesforceAuth = dlt.secrets.value,
+    sobject: str = dlt.config.value,
+    start_date: Optional[TAnyDateTime] = None,
+    incremental: Optional[dlt.sources.incremental[Any]] = DEFAULT_INCREMENTAL,
+    lag: Optional[float] = None,
+    soql_filter: Optional[str] = None,
+    include_deleted: bool = True,
+    double_as_decimal: bool = False,
+    backend: TTableBackend = "auto",
+    api: TQueryApi = "auto",
+    chunk_size: int = 50000,
+    included_columns: Optional[List[str]] = None,
+    excluded_columns: Optional[List[str]] = None,
+    write_disposition: Optional[TWriteDispositionConfig] = None,
+    primary_key: TColumnNames = None,
+    merge_key: TColumnNames = None,
+    defer_table_reflect: bool = False,
+) -> DltResource:
+    """Loads a single sObject, including custom objects, with a SOQL query.
+
+    Fields and their types are taken from the sObject `describe()` and passed as column hints.
+    Requests are retried on HTTP 429, 5xx and the limit of concurrent long requests, an expired
+    session is renewed by logging in again.
+
+    Args:
+        credentials (SalesforceAuth): Salesforce credentials.
+        sobject (str): API name of the sObject, e.g. `Account` or `Invoice__c`. Config is
+            resolved under `sources.salesforce.<sobject>`.
+        start_date (Optional[TAnyDateTime]): Loads records changed since this date on the first
+            run, all records if not set. It is the initial value of the default incremental on
+            the first of `SystemModstamp`, `LastModifiedDate`, `CreatedDate` and `LoginTime`
+            present in the sObject, it wins over the `initial_value` of an incremental without
+            `cursor_path`. The "replace" write disposition loads all records, or the records
+            changed since `start_date`, on each run.
+        incremental (Optional[dlt.sources.incremental[Any]]): The default incremental if not
+            passed, an incremental without `cursor_path` sets its values. Your own incremental is
+            used as is, without lag. `None` loads all records on each run. The incremental
+            generates the WHERE clause of the query. Setting `row_order` adds ORDER BY, which
+            disables PK chunking of Bulk API jobs.
+        lag (Optional[float]): Seconds re-read on each run by the default incremental, to catch
+            records committed late. 600 when merging, None otherwise.
+        soql_filter (Optional[str]): SOQL condition added to the WHERE clause, e.g.
+            `IsClosed = false AND Type = 'Customer'`.
+        include_deleted (bool): Also loads deleted records still in the recycle bin and archived
+            activities (`queryAll`). When merging, `IsDeleted` is the `hard_delete` column so
+            records deleted in Salesforce are deleted from the destination.
+        double_as_decimal (bool): Loads `double` and `percent` fields, e.g. custom number
+            fields, as decimals with the field precision and scale instead of floats.
+        backend (TTableBackend): "pyarrow" yields Arrow tables, "python" lists of dicts and does
+            not require `pyarrow`. "auto" uses `pyarrow` if installed. Both give the same types.
+        api (TQueryApi): "bulk" runs a Bulk API 2.0 query job, "rest" pages through the REST API
+            query results. "auto" uses the REST API when the Bulk API does not support the
+            sObject, e.g. `TaskStatus`, or is not enabled in the org.
+        chunk_size (int): Maximum number of records in a result page.
+        included_columns (Optional[List[str]]): Fields to load, all queryable fields if not set.
+        excluded_columns (Optional[List[str]]): Fields to skip.
+        write_disposition (Optional[TWriteDispositionConfig]): If not set: "merge" for a cursor
+            on `SystemModstamp`, `LastModifiedDate` or a custom field, "append" for insert-only
+            sObjects with `CreatedDate` or `LoginTime` cursor, "replace" without incremental.
+            From dlt 1.32 `{"disposition": "replace"}` keeps the incremental state, so the table
+            is replaced with the records changed since the last run.
+        primary_key (TColumnNames): Primary key, the `Id` field of the sObject if not set.
+        merge_key (TColumnNames): Merge key of the resource.
+        defer_table_reflect (bool): Logs in and describes the sObject only when extracting, so
+            creating the resource makes no API calls. Enable when running on Airflow. Column
+            hints are then set when extracting and the default incremental expects
+            `SystemModstamp`, which all custom and nearly all standard sObjects have.
+
+    Returns:
+        DltResource: The dlt resource loading the sObject.
+    """
+    if start_date is not None and not is_default_incremental(incremental):
+        raise ValueError(
+            "`start_date` sets the default incremental, do not pass `incremental`"
+        )
+    return table_resource(
+        _connection(credentials, None),
+        sobject,
+        start_date=start_date,
+        incremental=incremental,
+        lag=lag,
+        soql_filter=soql_filter,
+        include_deleted=include_deleted,
+        double_as_decimal=double_as_decimal,
+        backend=backend,
+        api=api,
+        chunk_size=chunk_size,
+        included_columns=included_columns,
+        excluded_columns=excluded_columns,
+        write_disposition=write_disposition,
+        primary_key=primary_key,
+        merge_key=merge_key,
+        parallelized=True,
+        defer_table_reflect=defer_table_reflect,
+    )

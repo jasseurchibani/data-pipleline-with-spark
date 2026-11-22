@@ -1,0 +1,103 @@
+
+name: test postgres and duckdb
+
+on:
+  pull_request:
+    branches:
+      - master
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  ALL_DESTINATIONS: '["postgres", "duckdb"]'
+  DLT_SECRETS_TOML: ${{ secrets.DLT_SECRETS_TOML }}
+  # DESTINATIONS_SECRETS: ${{ secrets.DESTINATIONS_SECRETS }}
+  # SOURCES_SECRETS: ${{ secrets.SOURCES_SECRETS }}
+  RUNTIME__LOG_LEVEL: ERROR
+
+jobs:
+  get_changed_sources:
+    uses: ./.github/workflows/get_changed_sources.yml
+    # pull_request from forks has no secrets, fork_tests_with_secrets.yml runs these tests
+    if: ${{ github.event_name == 'pull_request_target' || !github.event.pull_request.head.repo.fork }}
+
+  run_loader:
+    name: test destinations postgres and duckdb
+    needs: get_changed_sources
+    if: needs.get_changed_sources.outputs.sources_list != ''
+    strategy:
+      max-parallel: 2
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-latest", "windows-latest"]
+    defaults:
+      run:
+        shell: bash
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          # fork code runs only after the `fork-ci` approval in fork_tests_with_secrets.yml
+          allow-unsafe-pr-checkout: true
+
+      - name: Install tzdata on windows
+        run: |
+          cd %USERPROFILE%
+          curl https://data.iana.org/time-zones/releases/tzdata2021e.tar.gz --output tzdata.tar.gz
+          mkdir tzdata
+          tar --extract --file tzdata.tar.gz --directory tzdata
+          mkdir %USERPROFILE%\Downloads\tzdata
+          copy tzdata %USERPROFILE%\Downloads\tzdata
+          curl https://raw.githubusercontent.com/unicode-org/cldr/master/common/supplemental/windowsZones.xml --output %USERPROFILE%\Downloads\tzdata\windowsZones.xml
+        if: runner.os == 'Windows'
+        shell: cmd
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: make dev
+
+      - name: create secrets.toml
+        run: pwd && echo "$DLT_SECRETS_TOML" > sources/.dlt/secrets.toml
+      #   run: pwd && echo "$DESTINATIONS_SECRETS" > sources/.dlt/secrets.toml && echo "$SOURCES_SECRETS" >> sources/.dlt/secrets.toml
+      # - name: Setup upterm session
+      #   uses: lhotari/action-upterm@v1
+      - name: Start local MongoDB
+        if: runner.os == 'Linux' && contains(needs.get_changed_sources.outputs.sources_list, 'mongodb')
+        run: |
+          docker compose -f tests/mongodb/docker-compose.yml up -d --wait || {
+            docker compose -f tests/mongodb/docker-compose.yml ps -a
+            docker compose -f tests/mongodb/docker-compose.yml logs
+            exit 1
+          }
+      - name: Start local Kafka
+        if: runner.os == 'Linux' && contains(needs.get_changed_sources.outputs.sources_list, 'kafka')
+        run: |
+          bash tests/kafka/certs/generate.sh
+          docker compose -f tests/kafka/docker-compose.yml up -d --wait || {
+            docker compose -f tests/kafka/docker-compose.yml ps -a
+            docker compose -f tests/kafka/docker-compose.yml logs
+            exit 1
+          }
+      - run: |
+          sources_list="${{ needs.get_changed_sources.outputs.sources_list }}"
+          test_paths=$(echo "$sources_list" | awk '{for(i=1;i<=NF;i++) printf "tests/%s ", $i}')
+          uv run pytest $test_paths
+        if: runner.os != 'Windows'
+        name: Run tests on Linux/macOS
+      - run: |
+          FOR %%i IN (${{ needs.get_changed_sources.outputs.sources_list }}) DO (
+            echo Running tests for: %%i
+            uv run pytest tests/%%i
+            IF ERRORLEVEL 1 SET TESTS_FAILED=1
+          )
+          IF DEFINED TESTS_FAILED EXIT /B 1
+        if: runner.os == 'Windows'
+        name: Run tests on Windows
+        shell: cmd
